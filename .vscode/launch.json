@@ -13,7 +13,9 @@
             "args": [
                 "--config",
                     "config.json",
-                "add-fw-rules",
+                "-k",
+                "-r",
+                "create",
             ]
         }
     ]
