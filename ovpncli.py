@@ -8,6 +8,7 @@ import ipaddress
 import json
 import sys, os
 import paramiko
+import shutil
 
 def get_client_ip(client_network):
     ip_network = ipaddress.ip_network(client_network, False)      
@@ -43,6 +44,11 @@ def os_file_exists():
         return os.path.exists(file_path)
     return wrapper
 
+def os_get_file():
+    def wrapper(from_path: str, to_path: str):
+        shutil.copy(from_path, to_path)
+    return wrapper
+
 def ssh_exec_command_decorator(ssh, pre_cmd: str = "", run: bool = False):
     if run:
         def run_wrapper(cmd: str):
@@ -70,6 +76,53 @@ def ssh_file_exists(sftp):
             return False
     return wrapper
 
+def ssh_get_file(sftp):
+    def wrapper(remote_path: str, local_path: str):
+        sftp.get(remote_path, local_path)
+    return wrapper
+
+def create_ovpn(ovpn_template_file_path: str, ovpn_file_path: str, key_file_name: str, crt_file_name: str, ovpn_remote: str):
+    if os.path.exists(ovpn_file_path):
+        print("OVPN file already exists: ", ovpn_file_path)
+        return
+    print("Creating OVPN file: ", ovpn_template_file_path, " -> ", ovpn_file_path)
+    src_file = open(ovpn_template_file_path, "rt")
+    try:
+        out_file = open(ovpn_file_path, "wt")
+        try:
+            key_line = ""
+            cert_line = ""
+            remote_line = ""
+            while True:
+                line = src_file.readline()
+                if not line:
+                    break
+                if (line.strip()+" ").startswith("key "):
+                    key_line = "key {}\n".format(key_file_name)
+                    line = key_line
+                elif (line.strip()+" ").startswith("cert "):
+                    cert_line = "cert {}\n".format(crt_file_name)
+                    line = cert_line
+                elif (line.strip()+" ").startswith("remote "):
+                    if ovpn_remote:
+                        remote_line = "remote {}\n".format(ovpn_remote)
+                        line = remote_line
+                out_file.write(line)
+            if not key_line:
+                key_line = "key {}\n".format(key_file_name)
+                out_file.write(key_line)
+            if not cert_line:
+                cert_line = "cert {}\n".format(crt_file_name)
+                out_file.write(cert_line)
+            if not remote_line:
+                if ovpn_remote:
+                    remote_line = "remote {}\n".format(ovpn_remote)
+                    out_file.write(remote_line)
+        finally:
+            out_file.close()
+    finally:
+        src_file.close()
+
 def main():
     load_dotenv()
 
@@ -91,6 +144,9 @@ def main():
     parser.add_argument('--client-ip-network', help="Client ip network")
     parser.add_argument('--easy-rsa-dir', help="Easy-rsa directory")
     parser.add_argument('--easy-rsa-keys-dir', help="Easy-rsa keys directory")
+    parser.add_argument('--ovpn-dir', help="OVPN output directory")
+    parser.add_argument('--ovpn-template-file', help="OVPN template file path")
+    parser.add_argument('--ovpn-remote', help='OVPN "remote" setting')
     parser.add_argument('--use-ssh', default=False, type=bool, help="Use SSH")
     parser.add_argument('--ssh-host', help='SSH host')
     parser.add_argument('--ssh-port', default=22, type=int, help='SSH port')
@@ -117,6 +173,9 @@ def main():
         if (args.keys):
             required_arg_names.append('easy_rsa_dir')
             required_arg_names.append('easy_rsa_keys_dir')
+            required_arg_names.append('ovpn_dir')
+            required_arg_names.append('ovpn_template_file')
+            required_arg_names.append('ovpn_remote')
             action = action+'_keys'
         else:
             required_arg_names.append('clients_dir')
@@ -156,8 +215,20 @@ def main():
         pre_cmd = ""
 
     exec_command = ssh_exec_command_decorator(ssh, pre_cmd, args.run) if args.use_ssh else os_exec_command_decorator(pre_cmd, args.run)
-
     file_exists = ssh_file_exists(sftp) if args.use_ssh else os_file_exists()
+    get_file = ssh_get_file(sftp) if args.use_ssh else os_get_file()
+
+    if (action == 'create_keys'):
+        ca_file_name = 'ca.crt'
+        ca_file_path = os.path.join(args.easy_rsa_keys_dir, ca_file_name)
+        ovpn_ca_file_path = os.path.join(args.ovpn_dir, ca_file_name)
+        print("Get: ", ca_file_path, " -> ", ovpn_ca_file_path)
+        get_file(ca_file_path, ovpn_ca_file_path)
+        ta_file_name = 'ta.key'
+        ta_file_path = os.path.join(args.easy_rsa_keys_dir, ta_file_name)
+        ovpn_ta_file_path = os.path.join(args.ovpn_dir, ta_file_name)
+        print("Get: ", ta_file_path, " -> ", ovpn_ta_file_path)
+        get_file(ta_file_path, ovpn_ta_file_path)
 
     for i in range(0, clients_count):
         client_name = "client" + str(i+client_index)
@@ -183,12 +254,22 @@ def main():
                 print("Creating key file: ", key_file_name)
                 cmd = "KEY_CN=" + client_name + "; ./build-key --batch " + client_name
                 exec_command(cmd)
-            # crt_file_name = client_name + ".crt"
-            # crt_file_path = os.path.join(args.easy_rsa_keys_dir, crt_file_name)
-            # if (file_exists(crt_file_path)):
-            #     print('Certificate file already exists: ', crt_file_path)
-            # else:
-            #     print('Certificate file does not exist: ', crt_file_path)
+            ovpn_key_file_path = os.path.join(args.ovpn_dir, key_file_name)
+            print("Get: ", key_file_path, " -> ", ovpn_key_file_path)
+            get_file(key_file_path, ovpn_key_file_path)
+            crt_file_name = client_name + ".crt"
+            crt_file_path = os.path.join(args.easy_rsa_keys_dir, crt_file_name)
+            if (file_exists(crt_file_path)):
+                ovpn_crt_file_path = os.path.join(args.ovpn_dir, crt_file_name)
+                print("Get: ", crt_file_path, " -> ", ovpn_crt_file_path)
+                get_file(crt_file_path, ovpn_crt_file_path)
+                ovpn_file_name = client_name + ".ovpn"
+                ovpn_file_path = os.path.join(args.ovpn_dir, ovpn_file_name)
+                ovpn_template_file_path = args.ovpn_template_file
+                ovpn_remote = args.ovpn_remote
+                create_ovpn(ovpn_template_file_path, ovpn_file_path, key_file_name, crt_file_name, ovpn_remote)
+            else:
+                print('Certificate file does not exist: ', crt_file_path)
 #        if (action == 'clean_keys'):
 #            key_file_name = client_name + ".key"
 #            key_file_path = os.path.join(args.easy_rsa_keys_dir, key_file_name)
